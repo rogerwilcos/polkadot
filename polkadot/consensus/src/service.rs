@@ -24,6 +24,7 @@ use std::time::{Duration, Instant};
 use std::sync::Arc;
 use std::collections::{HashMap, VecDeque};
 use futures::{future, Future, Stream, Sink, Async, Canceled, Poll};
+use futures::sync::oneshot;
 use parking_lot::Mutex;
 use substrate_network as net;
 use tokio_core::reactor;
@@ -221,6 +222,7 @@ impl<E> Sink for BftSink<E> {
 /// Consensus service. Starts working when created.
 pub struct Service {
 	thread: Option<thread::JoinHandle<()>>,
+	exit: Option<oneshot::Sender<()>>,
 }
 
 struct Network(Arc<net::ConsensusService>);
@@ -269,6 +271,7 @@ impl Service {
 	) -> Service
 		where C: BlockchainEvents + ChainHead + bft::BlockImport + bft::Authorities + PolkadotApi + Send + Sync + 'static
 	{
+		let (exit_send, exit_receive) = oneshot::channel();
 		let thread = thread::spawn(move || {
 			let mut core = reactor::Core::new().expect("tokio::Core could not be created");
 			let key = Arc::new(key);
@@ -282,13 +285,18 @@ impl Service {
 			let bft_service = Arc::new(BftService::new(client.clone(), key, factory));
 
 			let handle = core.handle();
-			let notifications = client.import_notification_stream().for_each(|notification| {
+			let c = client.clone();
+			let n = network.clone();
+			let s = bft_service.clone();
+			let m = messages.clone();
+			let notifications = client.import_notification_stream().for_each(move |notification| {
 				if notification.is_new_best {
-					start_bft(&notification.header, handle.clone(), &*client, network.clone(), &*bft_service, messages.clone());
+					start_bft(&notification.header, handle.clone(), &*c, n.clone(), &*s, m.clone());
 				}
 				Ok(())
 			});
 
+			let handle = core.handle();
 			let interval = reactor::Interval::new_at(Instant::now() + Duration::from_millis(TIMER_DELAY_MS), Duration::from_millis(TIMER_INTERVAL_MS), &handle).unwrap();
 			let mut prev_best = match client.best_block_header() {
 				Ok(header) => header.blake2_256(),
@@ -315,12 +323,14 @@ impl Service {
 				Ok(())
 			});
 			core.handle().spawn(timed);
-			if let Err(e) = core.run(notifications) {
+			core.handle().spawn(notifications);
+			if let Err(e) = core.run(exit_receive) {
 				debug!("BFT event loop error {:?}", e);
 			}
 		});
 		Service {
-			thread: Some(thread)
+			exit: Some(exit_send),
+			thread: Some(thread),
 		}
 	}
 }
@@ -328,6 +338,7 @@ impl Service {
 impl Drop for Service {
 	fn drop(&mut self) {
 		if let Some(thread) = self.thread.take() {
+			self.exit.take().map(|s| s.send(()));
 			thread.join().expect("The service thread has panicked");
 		}
 	}

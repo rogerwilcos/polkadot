@@ -50,6 +50,7 @@ mod config;
 use std::sync::Arc;
 use std::thread;
 use futures::prelude::*;
+use futures::sync::oneshot;
 use parking_lot::Mutex;
 use tokio_core::reactor::Core;
 use codec::Slicable;
@@ -77,6 +78,7 @@ pub struct Service {
 	client: Arc<Client>,
 	network: Arc<network::Service>,
 	transaction_pool: Arc<Mutex<TransactionPool>>,
+	exit: Option<oneshot::Sender<()>>,
 	_consensus: Option<consensus::Service>,
 }
 
@@ -296,19 +298,21 @@ impl Service {
 			None
 		};
 
+		let (exit_send, exit_receive) = oneshot::channel();
 		let thread_client = client.clone();
 		let thread_network = network.clone();
 		let thread_txpool = transaction_pool.clone();
 		let thread = thread::spawn(move || {
 			thread_network.start_network();
 			let mut core = Core::new().expect("tokio::Core could not be created");
-			let events = thread_client.import_notification_stream().for_each(|notification| {
+			let events = thread_client.import_notification_stream().for_each(move |notification| {
 				thread_network.on_block_imported(notification.hash, &notification.header);
 				prune_imported(&*thread_client, &*thread_txpool, notification.hash);
 
 				Ok(())
 			});
-			if let Err(e) = core.run(events) {
+			core.handle().spawn(events);
+			if let Err(e) = core.run(exit_receive) {
 				debug!("Polkadot service event loop shutdown with {:?}", e);
 			}
 			debug!("Polkadot service shutdown");
@@ -319,6 +323,7 @@ impl Service {
 			network: network,
 			transaction_pool: transaction_pool,
 			_consensus: consensus_service,
+			exit: Some(exit_send),
 		})
 	}
 
@@ -357,9 +362,9 @@ pub fn prune_imported(client: &Client, pool: &Mutex<TransactionPool>, hash: Head
 
 impl Drop for Service {
 	fn drop(&mut self) {
-		self.client.stop_notifications();
 		self.network.stop_network();
 		if let Some(thread) = self.thread.take() {
+			self.exit.take().map(|s| s.send(()));
 			thread.join().expect("The service thread has panicked");
 		}
 	}
